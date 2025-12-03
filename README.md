@@ -144,7 +144,7 @@ The optimizer uses a **greedy bucket-splitting algorithm**:
 4. Repeat for each sub-bucket until no improvement is possible
 5. Return the optimized row ordering
 
-This is the same algorithm used by Microsoft's VertiPaq engine, reverse-engineered from Analysis Services binary.
+This is the same algorithm used by Microsoft's VertiPaq engine.
 
 ## 🔬 Research Background
 
