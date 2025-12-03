@@ -148,7 +148,7 @@ This is the same algorithm used by Microsoft's VertiPaq engine, reverse-engineer
 
 ## 🔬 Research Background
 
-This implementation is based on reverse engineering Microsoft SQL Server Analysis Services (xmsrv.dll) and the VertiPaq engine. Key insights:
+This implementation is based on reverse engineering Microsoft SQL Server Analysis Services traces. Key insights:
 
 - **Patent**: US 8,452,737 B2 - "Optimizing data compression using hybrid algorithm"
 - **Technique**: Greedy hybrid RLE optimization with bucket-based partitioning

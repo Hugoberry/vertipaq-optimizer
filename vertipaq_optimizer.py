@@ -19,7 +19,7 @@ __version__ = "1.0.0"
 __all__ = ['optimize_table', 'VertiPaqOptimizer']
 
 
-# Algorithm constants (derived from reverse engineering)
+# Algorithm constants (derived from reverse engineering and MS-XLDM spec)
 MIN_SPLIT_SIZE = 64
 BIT_SAVINGS_THRESHOLD = 0.1
 INITIAL_MAX_SAVINGS = -1.0
