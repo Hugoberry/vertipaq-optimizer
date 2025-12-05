@@ -27,6 +27,11 @@ SAMPLING_THRESHOLD = 10000
 SAMPLING_DIVISOR = 10000.0
 SAMPLING_ADDER = 1.0
 
+# Special value handling
+NAN_PLACEHOLDER = np.iinfo(np.int32).min  # Use min int32 as NaN placeholder
+INF_POS_PLACEHOLDER = np.iinfo(np.int32).max  # Use max int32 as +Inf placeholder
+INF_NEG_PLACEHOLDER = np.iinfo(np.int32).min + 1  # Use min+1 int32 as -Inf placeholder
+
 
 class VertiPaqOptimizer:
     """
@@ -118,27 +123,80 @@ class VertiPaqOptimizer:
         data: Union[pd.DataFrame, Dict[str, np.ndarray], List[np.ndarray]],
         columns: Optional[List[str]]
     ) -> Tuple[List[np.ndarray], List[str]]:
-        """Convert input data to list of NumPy arrays."""
+        """Convert input data to list of NumPy arrays, handling NaN and Inf values."""
         if isinstance(data, pd.DataFrame):
             if columns is None:
                 # Use all numeric columns
                 columns = data.select_dtypes(include=[np.number]).columns.tolist()
             
-            arrays = [data[col].astype(np.int32).values for col in columns]
+            arrays = [self._safe_convert_column(data[col].values, col) for col in columns]
             return arrays, columns
         
         elif isinstance(data, dict):
             column_names = columns or list(data.keys())
-            arrays = [np.asarray(data[col], dtype=np.int32) for col in column_names]
+            arrays = [self._safe_convert_column(np.asarray(data[col]), col) for col in column_names]
             return arrays, column_names
         
         elif isinstance(data, list):
-            arrays = [np.asarray(col, dtype=np.int32) for col in data]
-            column_names = columns or [f"Column{i}" for i in range(len(arrays))]
+            column_names = columns or [f"Column{i}" for i in range(len(data))]
+            arrays = [self._safe_convert_column(np.asarray(col), name) for col, name in zip(data, column_names)]
             return arrays, column_names
         
         else:
             raise TypeError("Data must be DataFrame, dict, or list of arrays")
+    
+    def _safe_convert_column(self, arr: np.ndarray, col_name: str = "") -> np.ndarray:
+        """
+        Safely convert a column to int32, handling NaN and Inf values.
+        
+        NaN, +Inf, and -Inf values are replaced with special placeholder integers
+        to allow the optimization algorithm to process them. These special values
+        will be grouped together during optimization, which is the desired behavior
+        for compression purposes.
+        
+        Args:
+            arr: Input array (may contain NaN, Inf, or other special values)
+            col_name: Column name for verbose output
+            
+        Returns:
+            np.ndarray of int32 with special values replaced by placeholders
+        """
+        # Convert to float64 first to handle all numeric types uniformly
+        arr = np.asarray(arr, dtype=np.float64)
+        
+        # Create output array
+        result = np.empty(len(arr), dtype=np.int32)
+        
+        # Identify special values
+        nan_mask = np.isnan(arr)
+        pos_inf_mask = np.isposinf(arr)
+        neg_inf_mask = np.isneginf(arr)
+        valid_mask = ~(nan_mask | pos_inf_mask | neg_inf_mask)
+        
+        # Count special values for verbose output
+        nan_count = np.sum(nan_mask)
+        inf_count = np.sum(pos_inf_mask) + np.sum(neg_inf_mask)
+        
+        if self.verbose and (nan_count > 0 or inf_count > 0):
+            print(f"  Column '{col_name}': {nan_count:,} NaN, {inf_count:,} Inf values replaced with placeholders")
+        
+        # Handle valid values - clip to int32 range before conversion
+        if np.any(valid_mask):
+            valid_values = arr[valid_mask]
+            # Clip to safe int32 range (leaving room for placeholders)
+            clipped = np.clip(
+                valid_values, 
+                np.iinfo(np.int32).min + 2,  # Leave room for NaN and -Inf placeholders
+                np.iinfo(np.int32).max - 1   # Leave room for +Inf placeholder
+            )
+            result[valid_mask] = clipped.astype(np.int32)
+        
+        # Replace special values with placeholders
+        result[nan_mask] = NAN_PLACEHOLDER
+        result[pos_inf_mask] = INF_POS_PLACEHOLDER
+        result[neg_inf_mask] = INF_NEG_PLACEHOLDER
+        
+        return result
     
     def _calculate_bits(self, column: np.ndarray) -> float:
         """Calculate bits needed to encode a column."""
@@ -460,3 +518,22 @@ if __name__ == "__main__":
     print(f"  Optimized in: {result['steps']:,} steps")
     print(f"  RLE clusters: {result['clusters']:,}")
     print(f"  Improvement: {result['compression_ratio']:.2f}x")
+    
+    # Test with NaN and Inf values
+    print("\n" + "="*50)
+    print("Testing NaN/Inf handling...")
+    
+    test_df_with_nulls = pd.DataFrame({
+        'Value': [1.0, 2.0, np.nan, 4.0, np.inf, -np.inf, 7.0, np.nan, 9.0, 10.0] * 1000,
+        'Category': np.random.randint(1, 5, 10000).astype(float)
+    })
+    # Add some NaN values to Category
+    test_df_with_nulls.loc[::100, 'Category'] = np.nan
+    
+    result_nulls = optimize_table(test_df_with_nulls, verbose=True)
+    
+    print(f"\n✓ NaN/Inf test passed!")
+    print(f"  Original: {test_df_with_nulls.shape[0]:,} rows")
+    print(f"  Optimized in: {result_nulls['steps']:,} steps")
+    print(f"  RLE clusters: {result_nulls['clusters']:,}")
+    print(f"  Improvement: {result_nulls['compression_ratio']:.2f}x")
