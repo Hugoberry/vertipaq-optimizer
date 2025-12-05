@@ -123,13 +123,15 @@ class VertiPaqOptimizer:
         data: Union[pd.DataFrame, Dict[str, np.ndarray], List[np.ndarray]],
         columns: Optional[List[str]]
     ) -> Tuple[List[np.ndarray], List[str]]:
-        """Convert input data to list of NumPy arrays, handling NaN and Inf values."""
+        """Convert input data to list of NumPy arrays, handling NaN, Inf, and string values."""
         if isinstance(data, pd.DataFrame):
             if columns is None:
-                # Use all numeric columns
-                columns = data.select_dtypes(include=[np.number]).columns.tolist()
+                # Use all numeric and object/string columns
+                numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+                string_cols = data.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
+                columns = numeric_cols + string_cols
             
-            arrays = [self._safe_convert_column(data[col].values, col) for col in columns]
+            arrays = [self._safe_convert_column(data[col], col) for col in columns]
             return arrays, columns
         
         elif isinstance(data, dict):
@@ -145,24 +147,78 @@ class VertiPaqOptimizer:
         else:
             raise TypeError("Data must be DataFrame, dict, or list of arrays")
     
-    def _safe_convert_column(self, arr: np.ndarray, col_name: str = "") -> np.ndarray:
+    def _safe_convert_column(self, col_data: Union[pd.Series, np.ndarray], col_name: str = "") -> np.ndarray:
         """
-        Safely convert a column to int32, handling NaN and Inf values.
+        Safely convert a column to int32, handling NaN, Inf, and string values.
         
-        NaN, +Inf, and -Inf values are replaced with special placeholder integers
-        to allow the optimization algorithm to process them. These special values
-        will be grouped together during optimization, which is the desired behavior
-        for compression purposes.
+        For numeric columns: NaN, +Inf, and -Inf values are replaced with special 
+        placeholder integers.
+        
+        For string/object columns: Values are encoded as integers using factorization,
+        with NaN/None values assigned a special placeholder.
         
         Args:
-            arr: Input array (may contain NaN, Inf, or other special values)
+            col_data: Input column (Series or array, may contain NaN, Inf, strings, etc.)
+            col_name: Column name for verbose output
+            
+        Returns:
+            np.ndarray of int32 with values encoded as integers
+        """
+        # Convert to pandas Series for consistent handling
+        if not isinstance(col_data, pd.Series):
+            col_data = pd.Series(col_data)
+        
+        # Check if this is a string/object column
+        if col_data.dtype == 'object' or col_data.dtype.name in ('string', 'category'):
+            return self._convert_string_column(col_data, col_name)
+        else:
+            return self._convert_numeric_column(col_data, col_name)
+    
+    def _convert_string_column(self, col_data: pd.Series, col_name: str = "") -> np.ndarray:
+        """
+        Convert string/object column to int32 using factorization.
+        
+        Args:
+            col_data: Input column with string/object values
+            col_name: Column name for verbose output
+            
+        Returns:
+            np.ndarray of int32 with strings encoded as integers
+        """
+        # Use pandas factorize to encode strings as integers
+        # factorize returns (codes, uniques) where codes are integers
+        # NaN values get code -1
+        codes, uniques = pd.factorize(col_data, use_na_sentinel=True)
+        
+        # Count null values
+        null_count = np.sum(codes == -1)
+        
+        if self.verbose:
+            print(f"  Column '{col_name}': string/object type, {len(uniques):,} unique values", end="")
+            if null_count > 0:
+                print(f", {null_count:,} null values")
+            else:
+                print()
+        
+        # Convert to int32, mapping -1 (NaN) to NAN_PLACEHOLDER
+        result = codes.astype(np.int32)
+        result[codes == -1] = NAN_PLACEHOLDER
+        
+        return result
+    
+    def _convert_numeric_column(self, col_data: pd.Series, col_name: str = "") -> np.ndarray:
+        """
+        Convert numeric column to int32, handling NaN and Inf values.
+        
+        Args:
+            col_data: Input column with numeric values
             col_name: Column name for verbose output
             
         Returns:
             np.ndarray of int32 with special values replaced by placeholders
         """
         # Convert to float64 first to handle all numeric types uniformly
-        arr = np.asarray(arr, dtype=np.float64)
+        arr = col_data.to_numpy(dtype=np.float64)
         
         # Create output array
         result = np.empty(len(arr), dtype=np.int32)
@@ -537,3 +593,22 @@ if __name__ == "__main__":
     print(f"  Optimized in: {result_nulls['steps']:,} steps")
     print(f"  RLE clusters: {result_nulls['clusters']:,}")
     print(f"  Improvement: {result_nulls['compression_ratio']:.2f}x")
+    
+    # Test with string/varchar columns
+    print("\n" + "="*50)
+    print("Testing string/varchar handling...")
+    
+    test_df_strings = pd.DataFrame({
+        'Region': np.random.choice(['North', 'South', 'East', 'West'], 10000),
+        'Country': np.random.choice(['USA', 'Canada', 'Mexico', 'Brazil', None], 10000),
+        'ProductName': np.random.choice(['Widget A', 'Widget B', 'Gadget X', 'Gadget Y', 'Tool Z'], 10000),
+        'CategoryID': np.random.randint(1, 10, 10000)
+    })
+    
+    result_strings = optimize_table(test_df_strings, verbose=True)
+    
+    print(f"\n✓ String/varchar test passed!")
+    print(f"  Original: {test_df_strings.shape[0]:,} rows")
+    print(f"  Optimized in: {result_strings['steps']:,} steps")
+    print(f"  RLE clusters: {result_strings['clusters']:,}")
+    print(f"  Improvement: {result_strings['compression_ratio']:.2f}x")
