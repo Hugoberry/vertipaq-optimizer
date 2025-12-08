@@ -818,15 +818,15 @@ if __name__ == "__main__":
     # Create test data
     np.random.seed(42)
     test_df = pd.DataFrame({
-        'ProductID': np.random.randint(1, 100, 10000),
-        'Category': np.random.choice(['Electronics', 'Books', 'Clothing'], 10000),
-        'Date': pd.date_range('2024-01-01', periods=10000, freq='1h'),
-        'Quantity': np.random.randint(1, 50, 10000),
-        'Price': np.random.uniform(10, 1000, 10000)
+        'ProductID': np.random.randint(1, 100, 1000000),
+        'Category': np.random.choice(['Electronics', 'Books', 'Clothing'], 1000000),
+        'Date': pd.date_range('2024-01-01', periods=1000000, freq='1h'),
+        'Quantity': np.random.randint(1, 50, 1000000),
+        'Price': np.random.uniform(10, 1000, 1000000)
     })
     
     # Add some nulls
-    null_mask = np.random.random(10000) < 0.05
+    null_mask = np.random.random(1000000) < 0.05
     test_df.loc[null_mask, 'Quantity'] = None
     
     print(f"\nTest data:")
