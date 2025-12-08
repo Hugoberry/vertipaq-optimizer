@@ -37,7 +37,7 @@ __version__ = "2.0.0"
 __all__ = ['optimize_table', 'VertiPaqOptimizer', 'optimize_parquet']
 
 
-# Algorithm constants
+# Algorithm constants (from reverse engineering Microsoft Analysis Services)
 MIN_SPLIT_SIZE = 64              # Minimum rows to create a split
 BIT_SAVINGS_THRESHOLD = 0.1      # Minimum bit savings to continue
 INITIAL_MAX_SAVINGS = -1.0       # Starting value for greedy maximum
@@ -545,6 +545,9 @@ class _HistogramBuilder:
         
         # Dictionary-encoded columns: work with indices directly
         if col_stats.is_dictionary:
+            # For dictionary columns, combine chunks and get indices
+            if isinstance(sampled_values, pa.ChunkedArray):
+                sampled_values = sampled_values.combine_chunks()
             indices = sampled_values.indices
             value_counts = pc.value_counts(indices)
             
@@ -552,7 +555,9 @@ class _HistogramBuilder:
                 return None, 0
             
             counts_field = value_counts.field('counts')
-            max_idx = pc.argmax(counts_field).as_py()
+            # Find index of maximum count
+            counts_array = counts_field.to_numpy()
+            max_idx = np.argmax(counts_array)
             
             most_frequent = value_counts.field('values')[max_idx].as_py()
             frequency = counts_field[max_idx].as_py()
@@ -562,13 +567,18 @@ class _HistogramBuilder:
         
         # Non-dictionary columns: standard histogram
         else:
+            # Combine chunks if needed for consistent handling
+            if isinstance(sampled_values, pa.ChunkedArray):
+                sampled_values = sampled_values.combine_chunks()
             value_counts = pc.value_counts(sampled_values)
             
             if len(value_counts) == 0:
                 return None, 0
             
             counts_field = value_counts.field('counts')
-            max_idx = pc.argmax(counts_field).as_py()
+            # Find index of maximum count
+            counts_array = counts_field.to_numpy()
+            max_idx = np.argmax(counts_array)
             
             most_frequent = value_counts.field('values')[max_idx].as_py()
             frequency = counts_field[max_idx].as_py()
@@ -606,7 +616,7 @@ def _partition_rows(
         column: Column data
         start: Start index in bucket
         end: End index in bucket
-        target_value: Value to partition by
+        target_value: Value to partition by (for dictionary columns, this is an index)
         null_strategy: How to handle nulls
             'separate' - Group nulls together
             'scatter' - Nulls don't match any value
@@ -620,6 +630,17 @@ def _partition_rows(
     # Get values for these rows
     values = pc.take(column, range_indices)
     
+    # For dictionary-encoded columns, we need to compare indices, not values
+    is_dictionary = pa.types.is_dictionary(column.type)
+    if is_dictionary:
+        # Combine chunks if needed
+        if isinstance(values, pa.ChunkedArray):
+            values = values.combine_chunks()
+        # Extract dictionary indices for comparison
+        comparison_values = values.indices
+    else:
+        comparison_values = values
+    
     # Create comparison mask
     if target_value is None:
         # Matching nulls specifically
@@ -629,17 +650,23 @@ def _partition_rows(
         if null_strategy == 'separate':
             # Nulls don't match non-null values (VertiPaq behavior)
             mask = pc.and_(
-                pc.equal(values, pa.scalar(target_value)),
+                pc.equal(comparison_values, pa.scalar(target_value)),
                 pc.is_valid(values)
             )
         else:
             # Simple comparison (nulls automatically don't match)
-            mask = pc.equal(values, pa.scalar(target_value))
+            mask = pc.equal(comparison_values, pa.scalar(target_value))
     
     # Filter rows into matching and non-matching groups
     matching_indices = pc.filter(range_indices, mask)
     not_mask = pc.invert(mask)
     non_matching_indices = pc.filter(range_indices, not_mask)
+    
+    # pc.filter() can return ChunkedArray, need to combine for concat_arrays
+    if isinstance(matching_indices, pa.ChunkedArray):
+        matching_indices = matching_indices.combine_chunks()
+    if isinstance(non_matching_indices, pa.ChunkedArray):
+        non_matching_indices = non_matching_indices.combine_chunks()
     
     match_count = len(matching_indices)
     
@@ -654,6 +681,12 @@ def _partition_rows(
         # Replace middle section only
         before = row_indices[:start] if start > 0 else None
         after = row_indices[end+1:] if end < len(row_indices) - 1 else None
+        
+        # Ensure all parts are Arrays, not ChunkedArrays
+        if before is not None and isinstance(before, pa.ChunkedArray):
+            before = before.combine_chunks()
+        if after is not None and isinstance(after, pa.ChunkedArray):
+            after = after.combine_chunks()
         
         parts = [p for p in [before, reordered, after] if p is not None]
         new_row_indices = pa.concat_arrays(parts)
