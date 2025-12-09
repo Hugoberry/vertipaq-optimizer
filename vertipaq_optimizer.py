@@ -16,9 +16,6 @@ Algorithm Overview:
 3. Repeat until no profitable splits remain
 4. Return optimized row ordering
 
-Based on Microsoft Patent US 8,452,737 B2:
-"Optimizing data compression using hybrid algorithm"
-
 License: MIT
 Version: 2.0.0
 """
@@ -37,7 +34,6 @@ __version__ = "2.0.0"
 __all__ = ['optimize_table', 'VertiPaqOptimizer', 'optimize_parquet']
 
 
-# Algorithm constants (from reverse engineering Microsoft Analysis Services)
 MIN_SPLIT_SIZE = 64              # Minimum rows to create a split
 BIT_SAVINGS_THRESHOLD = 0.1      # Minimum bit savings to continue
 INITIAL_MAX_SAVINGS = -1.0       # Starting value for greedy maximum

@@ -40,6 +40,7 @@ setup(
     install_requires=[
         "numpy>=1.19.0",
         "pandas>=1.0.0",
+        "pyarrow>=14.0.0",
     ],
     extras_require={
         "dev": [
