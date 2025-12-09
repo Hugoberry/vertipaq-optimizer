@@ -508,6 +508,10 @@ class _HistogramBuilder:
     - Finds the most frequent value
     - Supports sampling for large buckets (>10K rows)
     - Handles dictionary-encoded and regular columns differently
+    
+    Tie-breaking: When multiple values have the same maximum frequency,
+    the value that appears EARLIEST in the iteration order is selected.
+    This matches the v1 algorithm behavior.
     """
     
     def build_histogram(
@@ -532,6 +536,10 @@ class _HistogramBuilder:
         
         Returns:
             (most_frequent_value, scaled_frequency) or (None, 0) if all nulls
+            
+        Note:
+            Tie-breaking behavior: when multiple values have the same maximum
+            frequency, the value encountered first in iteration order wins.
         """
         # Sample rows from the bucket
         sampled_indices = row_indices[start:end+1:step]
@@ -545,18 +553,14 @@ class _HistogramBuilder:
             if isinstance(sampled_values, pa.ChunkedArray):
                 sampled_values = sampled_values.combine_chunks()
             indices = sampled_values.indices
-            value_counts = pc.value_counts(indices)
             
-            if len(value_counts) == 0:
+            # Get values as numpy for iteration-order tie-breaking
+            values_np = indices.to_numpy(zero_copy_only=False)
+            
+            most_frequent, frequency = self._find_max_with_tiebreak(values_np)
+            
+            if most_frequent is None:
                 return None, 0
-            
-            counts_field = value_counts.field('counts')
-            # Find index of maximum count
-            counts_array = counts_field.to_numpy()
-            max_idx = np.argmax(counts_array)
-            
-            most_frequent = value_counts.field('values')[max_idx].as_py()
-            frequency = counts_field[max_idx].as_py()
             
             # Scale frequency by sampling step to estimate true count
             return most_frequent, frequency * step
@@ -566,20 +570,119 @@ class _HistogramBuilder:
             # Combine chunks if needed for consistent handling
             if isinstance(sampled_values, pa.ChunkedArray):
                 sampled_values = sampled_values.combine_chunks()
-            value_counts = pc.value_counts(sampled_values)
             
-            if len(value_counts) == 0:
+            # Get values as numpy for iteration-order tie-breaking
+            values_np = sampled_values.to_numpy(zero_copy_only=False)
+            
+            most_frequent, frequency = self._find_max_with_tiebreak(values_np)
+            
+            if most_frequent is None:
                 return None, 0
             
-            counts_field = value_counts.field('counts')
-            # Find index of maximum count
-            counts_array = counts_field.to_numpy()
-            max_idx = np.argmax(counts_array)
-            
-            most_frequent = value_counts.field('values')[max_idx].as_py()
-            frequency = counts_field[max_idx].as_py()
-            
             return most_frequent, frequency * step
+    
+    def _find_max_with_tiebreak(self, values: np.ndarray) -> Tuple[Optional[int], int]:
+        """
+        Find the most frequent value with v1-compatible tie-breaking.
+        
+        Adaptively chooses between bincount (fast for dense data) and
+        np.unique (fast for sparse/high-cardinality data).
+        
+        When multiple values have the same maximum frequency, return the
+        value that FIRST REACHED that frequency level during iteration.
+        This matches v1 algorithm's array mode behavior.
+        
+        Args:
+            values: NumPy array of values in iteration order
+        
+        Returns:
+            (most_frequent_value, frequency) or (None, 0) if empty
+        """
+        if len(values) == 0:
+            return None, 0
+        
+        # Handle float arrays (may contain NaN)
+        if values.dtype.kind == 'f':
+            # Filter out NaN values
+            valid_mask = ~np.isnan(values)
+            if not valid_mask.any():
+                return None, 0
+            values = values[valid_mask].astype(np.int64)
+        
+        if len(values) == 0:
+            return None, 0
+        
+        # Get min/max for range calculation
+        min_val = values.min()
+        max_val = values.max()
+        value_range = max_val - min_val + 1
+        
+        # Choose strategy based on data density
+        # Use bincount for dense data (value_range <= 2x sample size)
+        # Use np.unique for sparse data (high cardinality)
+        use_bincount = value_range <= len(values) * 2
+        
+        if use_bincount:
+            # Dense data: use bincount (fast array-based histogram)
+            shifted = values - min_val
+            counts = np.bincount(shifted, minlength=value_range)
+            max_count = counts.max()
+            
+            if max_count == 0:
+                return None, 0
+            
+            max_indices = np.where(counts == max_count)[0]
+            
+            if len(max_indices) == 1:
+                return int(max_indices[0] + min_val), int(max_count)
+            
+            # Tie-breaking for bincount path
+            best_pos = len(values)
+            best_val = max_indices[0]
+            
+            for idx in max_indices:
+                positions = np.where(shifted == idx)[0]
+                reach_pos = positions[max_count - 1]
+                if reach_pos < best_pos:
+                    best_pos = reach_pos
+                    best_val = idx
+            
+            return int(best_val + min_val), int(max_count)
+        
+        else:
+            # Sparse data: use np.unique (hash-based, memory efficient)
+            unique_vals, counts = np.unique(values, return_counts=True)
+            max_count = counts.max()
+            
+            if max_count == 0:
+                return None, 0
+            
+            # Special case: all values appear only once (max_count == 1)
+            # Just return the first value in iteration order
+            if max_count == 1:
+                return int(values[0]), 1
+            
+            max_mask = counts == max_count
+            num_ties = max_mask.sum()
+            
+            if num_ties == 1:
+                # No ties - return the single max
+                max_idx = np.argmax(counts)
+                return int(unique_vals[max_idx]), int(max_count)
+            
+            # Ties exist - find which value first reaches max_count
+            candidates = unique_vals[max_mask]
+            best_pos = len(values)
+            best_val = candidates[0]
+            
+            for val in candidates:
+                positions = np.where(values == val)[0]
+                reach_pos = positions[max_count - 1]
+                if reach_pos < best_pos:
+                    best_pos = reach_pos
+                    best_val = val
+            
+            return int(best_val), int(max_count)
 
 
 # ============================================================================
