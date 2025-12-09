@@ -508,7 +508,16 @@ class _HistogramBuilder:
     - Finds the most frequent value
     - Supports sampling for large buckets (>10K rows)
     - Handles dictionary-encoded and regular columns differently
+    
+    IMPORTANT: Tie-breaking behavior must match v1 algorithm - when multiple
+    values have the same maximum frequency, select the one that appears
+    EARLIEST in the iteration order (lowest position in sampled data).
     """
+    
+    def __init__(self, max_value_range: int = 100000):
+        """Initialize with configurable value range threshold for array mode."""
+        self.max_value_range = max_value_range
+        self.array_buffer = None
     
     def build_histogram(
         self,
@@ -533,7 +542,121 @@ class _HistogramBuilder:
         Returns:
             (most_frequent_value, scaled_frequency) or (None, 0) if all nulls
         """
-        # Sample rows from the bucket
+        bucket_size = end - start + 1
+        
+        # For non-dictionary columns with reasonable value range, use array mode
+        # This matches v1's behavior for dense numeric data
+        # Only use array mode for integer-like columns where value_range makes sense
+        if not col_stats.is_dictionary:
+            try:
+                min_val = int(col_stats.min_val)
+                max_val = int(col_stats.max_val)
+                value_range = max_val - min_val + 1
+                
+                use_array_mode = (
+                    value_range > 0 and
+                    value_range <= self.max_value_range and
+                    value_range <= bucket_size * 2
+                )
+                
+                if use_array_mode:
+                    return self._build_array_mode(
+                        row_indices, column, start, end, step,
+                        min_val, value_range
+                    )
+            except (TypeError, ValueError, OverflowError):
+                # Fall back to hash mode for non-integer types
+                pass
+        
+        # Fall back to hash mode for dictionary columns or sparse numeric data
+        return self._build_hash_mode(
+            row_indices, column, start, end, step, col_stats
+        )
+    
+    def _build_array_mode(
+        self,
+        row_indices: pa.Array,
+        column: pa.ChunkedArray,
+        start: int,
+        end: int,
+        step: int,
+        min_val: int,
+        value_range: int
+    ) -> Tuple[Optional[int], int]:
+        """
+        Fast array-based histogram for dense numeric data.
+        
+        Uses inline max tracking like v1 to ensure consistent tie-breaking:
+        when multiple values have the same frequency, keeps the one that
+        FIRST REACHES that maximum frequency level (not first occurrence).
+        """
+        # Convert to numpy for efficient iteration
+        row_indices_np = row_indices.to_numpy()
+        
+        # Handle chunked array - combine chunks for consistent indexing
+        if isinstance(column, pa.ChunkedArray):
+            column = column.combine_chunks()
+        
+        # Handle nulls - use zero_copy_only=False for arrays with nulls
+        try:
+            column_np = column.to_numpy(zero_copy_only=False)
+        except (pa.ArrowInvalid, TypeError):
+            # Fall back to hash mode if conversion fails
+            return None, 0
+        
+        # Reuse buffer for histogram
+        if self.array_buffer is None or len(self.array_buffer) < value_range:
+            self.array_buffer = np.zeros(value_range, dtype=np.int32)
+        else:
+            self.array_buffer[:value_range] = 0
+        
+        histogram = self.array_buffer[:value_range]
+        max_freq = 0
+        max_value = min_val
+        
+        # Build histogram with inline max tracking (v1-compatible tie-breaking)
+        # This keeps the value that FIRST reaches each new maximum frequency
+        for i in range(start, end + 1, step):
+            row = row_indices_np[i]
+            value = column_np[row]
+            
+            # Skip nulls (NaN for float arrays, or masked values)
+            if isinstance(value, float) and np.isnan(value):
+                continue
+            if value is None or (hasattr(value, 'mask') and value.mask):
+                continue
+            
+            index = int(value) - min_val
+            if 0 <= index < value_range:
+                histogram[index] += 1
+                
+                # Only update max if strictly greater (keeps first to reach max)
+                if histogram[index] > max_freq:
+                    max_freq = histogram[index]
+                    max_value = int(value)
+        
+        if max_freq == 0:
+            return None, 0
+            
+        return max_value, max_freq * step
+    
+    def _build_hash_mode(
+        self,
+        row_indices: pa.Array,
+        column: pa.ChunkedArray,
+        start: int,
+        end: int,
+        step: int,
+        col_stats: _ColumnStats
+    ) -> Tuple[Optional[int], int]:
+        """
+        Memory-efficient hash-based histogram for sparse/dictionary data.
+        
+        For tie-breaking consistency with v1, when multiple values have
+        the same max frequency, we select the one that FIRST REACHES
+        that maximum frequency level during iteration.
+        """
+        # Sample rows from the bucket  
         sampled_indices = row_indices[start:end+1:step]
         
         # Get values for sampled rows
@@ -541,45 +664,59 @@ class _HistogramBuilder:
         
         # Dictionary-encoded columns: work with indices directly
         if col_stats.is_dictionary:
-            # For dictionary columns, combine chunks and get indices
             if isinstance(sampled_values, pa.ChunkedArray):
                 sampled_values = sampled_values.combine_chunks()
-            indices = sampled_values.indices
-            value_counts = pc.value_counts(indices)
-            
-            if len(value_counts) == 0:
-                return None, 0
-            
-            counts_field = value_counts.field('counts')
-            # Find index of maximum count
-            counts_array = counts_field.to_numpy()
-            max_idx = np.argmax(counts_array)
-            
-            most_frequent = value_counts.field('values')[max_idx].as_py()
-            frequency = counts_field[max_idx].as_py()
-            
-            # Scale frequency by sampling step to estimate true count
-            return most_frequent, frequency * step
-        
-        # Non-dictionary columns: standard histogram
+            working_values = sampled_values.indices
         else:
-            # Combine chunks if needed for consistent handling
             if isinstance(sampled_values, pa.ChunkedArray):
                 sampled_values = sampled_values.combine_chunks()
-            value_counts = pc.value_counts(sampled_values)
-            
-            if len(value_counts) == 0:
-                return None, 0
-            
-            counts_field = value_counts.field('counts')
-            # Find index of maximum count
-            counts_array = counts_field.to_numpy()
-            max_idx = np.argmax(counts_array)
-            
-            most_frequent = value_counts.field('values')[max_idx].as_py()
-            frequency = counts_field[max_idx].as_py()
-            
-            return most_frequent, frequency * step
+            working_values = sampled_values
+        
+        # Convert to numpy once for efficiency
+        working_np = working_values.to_numpy(zero_copy_only=False)
+        
+        if len(working_np) == 0:
+            return None, 0
+        
+        # Filter out nulls upfront for cleaner processing
+        if working_np.dtype.kind == 'f':  # Float types
+            valid_mask = ~np.isnan(working_np)
+            working_np = working_np[valid_mask]
+        elif working_np.dtype == object:  # Object dtype may have None
+            valid_mask = working_np != None
+            working_np = working_np[valid_mask]
+        
+        if len(working_np) == 0:
+            return None, 0
+        
+        # Use numpy's unique with return_inverse for vectorized counting
+        # return_inverse gives us iteration order for tie-breaking
+        unique_vals, inverse_indices, counts = np.unique(
+            working_np, return_inverse=True, return_counts=True
+        )
+        
+        max_count = counts.max()
+        tied_indices = np.where(counts == max_count)[0]
+        
+        if len(tied_indices) == 1:
+            # No tie - simple case
+            max_value = unique_vals[tied_indices[0]]
+        else:
+            # Tie-breaking: find which tied value appears first in iteration
+            # inverse_indices maps original positions to unique_vals indices
+            tied_set = set(tied_indices)
+            for idx in inverse_indices:
+                if idx in tied_set:
+                    max_value = unique_vals[idx]
+                    break
+            else:
+                max_value = unique_vals[tied_indices[0]]
+        
+        # Convert numpy scalar to Python type for consistent handling
+        if hasattr(max_value, 'item'):
+            max_value = max_value.item()
+        
+        return max_value, int(max_count) * step
 
 
 # ============================================================================
@@ -634,37 +771,62 @@ def _partition_rows(
             values = values.combine_chunks()
         # Extract dictionary indices for comparison
         comparison_values = values.indices
+        comparison_type = comparison_values.type
     else:
+        if isinstance(values, pa.ChunkedArray):
+            values = values.combine_chunks()
         comparison_values = values
+        comparison_type = column.type if isinstance(column, pa.Array) else column.chunk(0).type
     
     # Create comparison mask
     if target_value is None:
         # Matching nulls specifically
         mask = pc.is_null(values)
     else:
+        # Create a scalar with matching type for proper comparison
+        try:
+            target_scalar = pa.scalar(target_value, type=comparison_type)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, TypeError):
+            # If type casting fails, try without type specification
+            target_scalar = pa.scalar(target_value)
+        
         # Matching specific value
         if null_strategy == 'separate':
             # Nulls don't match non-null values (VertiPaq behavior)
             mask = pc.and_(
-                pc.equal(comparison_values, pa.scalar(target_value)),
+                pc.equal(comparison_values, target_scalar),
                 pc.is_valid(values)
             )
         else:
             # Simple comparison (nulls automatically don't match)
-            mask = pc.equal(comparison_values, pa.scalar(target_value))
+            mask = pc.equal(comparison_values, target_scalar)
     
-    # Filter rows into matching and non-matching groups
-    matching_indices = pc.filter(range_indices, mask)
-    not_mask = pc.invert(mask)
-    non_matching_indices = pc.filter(range_indices, not_mask)
-    
-    # pc.filter() can return ChunkedArray, need to combine for concat_arrays
-    if isinstance(matching_indices, pa.ChunkedArray):
-        matching_indices = matching_indices.combine_chunks()
-    if isinstance(non_matching_indices, pa.ChunkedArray):
-        non_matching_indices = non_matching_indices.combine_chunks()
-    
-    match_count = len(matching_indices)
+    # Optimized partition: Use PyArrow operations with proper null handling
+    # Fill nulls in mask with False so they end up in non-matching group
+    try:
+        mask_filled = pc.fill_null(mask, False)
+        not_mask = pc.invert(mask_filled)
+        
+        # Filter using PyArrow directly - much faster than numpy conversion
+        matching_indices = pc.filter(range_indices, mask_filled)
+        non_matching_indices = pc.filter(range_indices, not_mask)
+        
+        # Combine chunks if needed
+        if isinstance(matching_indices, pa.ChunkedArray):
+            matching_indices = matching_indices.combine_chunks()
+        if isinstance(non_matching_indices, pa.ChunkedArray):
+            non_matching_indices = non_matching_indices.combine_chunks()
+        
+        match_count = len(matching_indices)
+        
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        # Fallback to numpy if PyArrow operations fail
+        mask_np = mask.to_numpy(zero_copy_only=False)
+        range_indices_np = range_indices.to_numpy()
+        
+        matching_indices = pa.array(range_indices_np[mask_np == True])
+        non_matching_indices = pa.array(range_indices_np[mask_np != True])
+        match_count = len(matching_indices)
     
     # Concatenate: matching first, then non-matching
     reordered = pa.concat_arrays([matching_indices, non_matching_indices])
