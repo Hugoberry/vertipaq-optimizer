@@ -42,10 +42,14 @@ SEGMENT_SIZE = 1_000_000         # Rows per segment (Power BI alignment)
 MIN_SPLIT_SIZE = 64              # Minimum rows to create a split
 BIT_SAVINGS_THRESHOLD = 0.1      # Minimum bit savings to continue
 INITIAL_MAX_SAVINGS = -1.0       # Starting value for greedy maximum
-SAMPLING_THRESHOLD = 10000       # Bucket size to trigger sampling
-SAMPLING_DIVISOR = 10000.0       # Sample rate calculation divisor
+SAMPLING_THRESHOLD = 2000        # Bucket size to trigger sampling (more aggressive)
+SAMPLING_DIVISOR = 2000.0        # Sample rate calculation divisor (5% instead of 1%)
 SAMPLING_ADDER = 1.0             # Sample rate calculation offset
-MAX_STEPS_PER_SEGMENT = 100_000  # Maximum optimization steps per segment
+MAX_STEPS_PER_SEGMENT = 15_000   # Maximum optimization steps per segment (match PowerBI ~13-15k)
+MIN_FREQUENCY_RATIO = 0.02       # Minimum frequency ratio to consider a split (2%)
+MAX_PURE_BUCKET_RATIO = 0.95     # If bucket is >95% pure, mark column as done
+MAX_BUCKET_QUEUE_SIZE = 500      # Maximum buckets in queue (prevent explosion)
+MIN_BUCKET_PROCESS_SIZE = 64     # Don't process buckets smaller than MIN_SPLIT_SIZE
 
 
 class VertiPaqOptimizer:
@@ -381,15 +385,24 @@ class VertiPaqOptimizer:
         Returns:
             Tuple of (optimized_row_indices, step_count, total_clusters)
         """
+        from collections import deque
+        import heapq
+        
         segment_size = seg_end - seg_start + 1
         num_cols = len(columns)
         
         # Initialize row indices for this segment (0-based within segment)
         row_indices = pa.array(np.arange(segment_size, dtype=np.int32))
         
-        # Initialize bucket queue with single bucket for this segment
-        # Bucket indices are 0-based within the segment's row_indices array
-        buckets = deque([_Bucket(0, segment_size - 1)])
+        # Use priority queue: process largest buckets first (negative size for max-heap)
+        # Format: (-bucket_size, bucket_id, bucket)
+        bucket_queue = []
+        bucket_counter = 0
+        
+        # Initialize with single bucket for this segment
+        initial_bucket = _Bucket(0, segment_size - 1)
+        heapq.heappush(bucket_queue, (-segment_size, bucket_counter, initial_bucket))
+        bucket_counter += 1
         
         step_count = 0
         cluster_count = [0] * num_cols
@@ -400,12 +413,23 @@ class VertiPaqOptimizer:
         # Progress tracking
         progress_interval = 1000
         
+        # Track recent improvements for early termination
+        recent_improvements = 0
+        last_check_step = 0
+        improvement_check_interval = 1000
+        
         # Main optimization loop: process buckets until none remain
-        while buckets:
-            bucket = buckets.popleft()
+        while bucket_queue:
+            # Get largest bucket from priority queue
+            neg_size, _, bucket = heapq.heappop(bucket_queue)
+            bucket_size = -neg_size
             
             # Skip buckets that are already marked as done
             if bucket.is_done:
+                continue
+            
+            # Skip buckets that are too small to be worth processing
+            if bucket_size < MIN_BUCKET_PROCESS_SIZE:
                 continue
             
             step_count += 1
@@ -416,18 +440,37 @@ class VertiPaqOptimizer:
                     print(f"    [Segment] Hit max steps limit ({MAX_STEPS_PER_SEGMENT:,})")
                 break
             
+            # Check for diminishing returns periodically
+            if step_count - last_check_step >= improvement_check_interval:
+                if recent_improvements == 0 and step_count > improvement_check_interval:
+                    if self.verbose:
+                        print(f"    [Segment] Early termination: no improvements in last {improvement_check_interval} steps")
+                    break
+                recent_improvements = 0
+                last_check_step = step_count
+            
             # Progress logging
             if self.verbose and step_count % progress_interval == 0:
                 print(f"    [Segment {segment_idx}] Step {step_count:,}, "
-                      f"buckets in queue: {len(buckets):,}")
+                      f"buckets in queue: {len(bucket_queue):,}, processing bucket size: {bucket_size:,}")
             
-            bucket_size = bucket.size()
+            # Check bucket queue explosion
+            if len(bucket_queue) > MAX_BUCKET_QUEUE_SIZE:
+                # Keep only the largest buckets to prevent explosion
+                bucket_queue = bucket_queue[:MAX_BUCKET_QUEUE_SIZE]
+                heapq.heapify(bucket_queue)
+                if self.verbose and step_count % (progress_interval * 10) == 0:
+                    print(f"    [Segment {segment_idx}] Pruned bucket queue to {MAX_BUCKET_QUEUE_SIZE:,} buckets")
             
             # Determine sampling rate for this bucket
-            # For large buckets (>10K rows), sample ~1% for performance
+            # More aggressive sampling for better performance
             sample_step = 1
             if bucket_size >= SAMPLING_THRESHOLD:
-                sample_step = int(bucket_size / SAMPLING_DIVISOR + SAMPLING_ADDER)
+                sample_step = max(1, int(bucket_size / SAMPLING_DIVISOR + SAMPLING_ADDER))
+            
+            # Dynamic bit savings threshold based on bucket size
+            # Larger buckets need higher savings to justify the split
+            dynamic_threshold = BIT_SAVINGS_THRESHOLD * max(1.0, bucket_size / 10000.0)
             
             # Greedy selection: find column/value pair with maximum bit savings
             best_savings = INITIAL_MAX_SAVINGS
@@ -450,12 +493,21 @@ class VertiPaqOptimizer:
                     bucket.mark_column_done(col_idx)
                     continue
                 
+                # Scale frequency back to actual bucket size if we sampled
+                actual_freq = max_freq * sample_step
+                frequency_ratio = actual_freq / bucket_size
+                
+                # Skip if frequency is too low to be worth processing
+                if frequency_ratio < MIN_FREQUENCY_RATIO:
+                    bucket.mark_column_done(col_idx)
+                    continue
+                
                 # Calculate bit savings: frequency × bits_per_value
                 # This estimates how many bits we save by RLE-encoding this value
-                savings = max_freq * col_stats[col_idx].bits_per_value
+                savings = actual_freq * col_stats[col_idx].bits_per_value
                 
-                # Check threshold: is this worth splitting?
-                if savings < BIT_SAVINGS_THRESHOLD:
+                # Check dynamic threshold: is this worth splitting?
+                if savings < dynamic_threshold:
                     bucket.mark_column_done(col_idx)
                     continue
                 
@@ -481,16 +533,20 @@ class VertiPaqOptimizer:
             # Don't split if matching group is too small
             if match_count < MIN_SPLIT_SIZE:
                 bucket.is_done = True
-                buckets.append(bucket)
+                heapq.heappush(bucket_queue, (-bucket_size, bucket_counter, bucket))
+                bucket_counter += 1
                 continue
             
-            # Check if all rows match (bucket is now pure for this column)
+            # Check if bucket is sufficiently pure for this column
             non_match_count = bucket_size - match_count
-            if non_match_count < MIN_SPLIT_SIZE:
-                # All (or almost all) rows match - mark column as done
+            purity_ratio = match_count / bucket_size
+            
+            if non_match_count < MIN_SPLIT_SIZE or purity_ratio >= MAX_PURE_BUCKET_RATIO:
+                # Bucket is pure enough - mark column as done
                 bucket.mark_column_done(col_idx)
                 cluster_count[col_idx] += 1
-                buckets.append(bucket)
+                heapq.heappush(bucket_queue, (-bucket_size, bucket_counter, bucket))
+                bucket_counter += 1
                 continue
             
             # Create two new buckets from the split
@@ -506,12 +562,22 @@ class VertiPaqOptimizer:
             impure_bucket = _Bucket(bucket.start + match_count, bucket.end)
             impure_bucket.columns_done = bucket.columns_done
             
-            # Add buckets back to queue for further processing
-            buckets.append(pure_bucket)
-            buckets.append(impure_bucket)
+            # Add buckets back to queue for further processing (larger buckets first)
+            pure_size = pure_bucket.size()
+            impure_size = impure_bucket.size()
+            
+            # Only add buckets that are worth processing
+            if pure_size >= MIN_BUCKET_PROCESS_SIZE:
+                heapq.heappush(bucket_queue, (-pure_size, bucket_counter, pure_bucket))
+                bucket_counter += 1
+            
+            if impure_size >= MIN_BUCKET_PROCESS_SIZE:
+                heapq.heappush(bucket_queue, (-impure_size, bucket_counter, impure_bucket))
+                bucket_counter += 1
             
             # Track cluster creation (one RLE run created for this column)
             cluster_count[col_idx] += 1
+            recent_improvements += 1
         
         return row_indices, step_count, sum(cluster_count)
 
