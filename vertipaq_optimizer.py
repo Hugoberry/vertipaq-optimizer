@@ -6,15 +6,18 @@ VertiPaq engine (Power BI, Analysis Services) to optimize row ordering for
 Run-Length Encoding (RLE) compression in columnar databases.
 
 Algorithm Overview:
-1. Start with all rows in a single bucket
-2. For each bucket:
-   - Build histograms for each column
-   - Calculate bit savings for grouping the most frequent value
-   - Select column/value pair with maximum bit savings (greedy)
-   - Partition rows: matching values first, others after
-   - Split bucket into "pure" and "impure" sub-buckets
-3. Repeat until no profitable splits remain
-4. Return optimized row ordering
+1. Divide data into segments (1M rows each, aligned with Power BI's storage format)
+2. Process each segment in parallel using separate threads
+3. For each segment:
+   a. Start with all rows in a single bucket
+   b. For each bucket:
+      - Build histograms for each column
+      - Calculate bit savings for grouping the most frequent value
+      - Select column/value pair with maximum bit savings (greedy)
+      - Partition rows: matching values first, others after
+      - Split bucket into "pure" and "impure" sub-buckets
+   c. Repeat until no profitable splits remain
+4. Combine segment results into final optimized row ordering
 
 License: MIT
 Version: 2.0.0
@@ -27,19 +30,22 @@ import pandas as pd
 import numpy as np
 from typing import Union, List, Optional, Tuple, Dict
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import warnings
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __all__ = ['optimize_table', 'VertiPaqOptimizer', 'optimize_parquet']
 
 
+SEGMENT_SIZE = 1_000_000         # Rows per segment (Power BI alignment)
 MIN_SPLIT_SIZE = 64              # Minimum rows to create a split
 BIT_SAVINGS_THRESHOLD = 0.1      # Minimum bit savings to continue
 INITIAL_MAX_SAVINGS = -1.0       # Starting value for greedy maximum
 SAMPLING_THRESHOLD = 10000       # Bucket size to trigger sampling
 SAMPLING_DIVISOR = 10000.0       # Sample rate calculation divisor
 SAMPLING_ADDER = 1.0             # Sample rate calculation offset
+MAX_STEPS_PER_SEGMENT = 100_000  # Maximum optimization steps per segment
 
 
 class VertiPaqOptimizer:
@@ -83,6 +89,9 @@ class VertiPaqOptimizer:
         """
         Optimize row ordering for maximum RLE compression.
         
+        The algorithm processes data in segments (1M rows each, aligned with Power BI's
+        VertiPaq engine) and optimizes each segment in parallel using separate threads.
+        
         Args:
             data: Input data as pandas DataFrame, PyArrow Table, or Parquet file path
             columns: Specific columns to optimize (default: all except large binary)
@@ -97,6 +106,7 @@ class VertiPaqOptimizer:
                 - 'time': Execution time in seconds
                 - 'columns_optimized': List of column names processed
                 - 'num_rows': Number of rows processed
+                - 'num_segments': Number of segments processed
         
         Example:
             >>> result = optimizer.optimize(df, columns=['ProductID', 'Date'])
@@ -114,9 +124,13 @@ class VertiPaqOptimizer:
         # Compute column statistics
         col_stats = [_ColumnStats(col) for col in col_arrays]
         
+        # Calculate number of segments
+        num_segments = (table.num_rows + SEGMENT_SIZE - 1) // SEGMENT_SIZE
+        
         if self.verbose:
             print(f"\nVertiPaq Optimizer v{__version__}")
             print(f"Dataset: {table.num_rows:,} rows × {len(column_names)} columns")
+            print(f"Segments: {num_segments} ({SEGMENT_SIZE:,} rows each)")
             print(f"\nColumn Statistics:")
             for name, stats in zip(column_names, col_stats):
                 type_info = f"dict[{stats.dictionary_size}]" if stats.is_dictionary else "numeric"
@@ -143,11 +157,13 @@ class VertiPaqOptimizer:
             'compression_ratio': compression_ratio,
             'time': elapsed,
             'columns_optimized': column_names,
-            'num_rows': table.num_rows
+            'num_rows': table.num_rows,
+            'num_segments': num_segments
         }
         
         if self.verbose:
             print(f"\nOptimization complete!")
+            print(f"  Segments: {num_segments}")
             print(f"  Steps: {steps:,}")
             print(f"  RLE clusters: {clusters:,} (was {original_clusters:,})")
             print(f"  Compression improvement: {compression_ratio:.2f}x")
@@ -254,7 +270,10 @@ class VertiPaqOptimizer:
         """
         Core greedy bucket-splitting algorithm for row reordering.
         
-        Algorithm steps:
+        This method divides data into segments (aligned with Power BI's 1M row segments)
+        and processes each segment in parallel using separate threads.
+        
+        Algorithm steps per segment:
         1. Initialize with all rows in one bucket
         2. While buckets remain:
            a. Get next unprocessed bucket
@@ -268,7 +287,7 @@ class VertiPaqOptimizer:
               - Pure bucket: contains only matching values (RLE-friendly)
               - Impure bucket: contains remaining values (process further)
            f. Add buckets back to queue
-        3. Return final row ordering
+        3. Combine segment results into final row ordering
         
         Args:
             columns: List of column data arrays
@@ -278,16 +297,108 @@ class VertiPaqOptimizer:
             Tuple of (optimized_row_indices, step_count, total_clusters)
         """
         num_rows = len(columns[0])
+        
+        # Calculate number of segments (Power BI alignment: 1M rows per segment)
+        num_segments = (num_rows + SEGMENT_SIZE - 1) // SEGMENT_SIZE
+        
+        if self.verbose and num_segments > 1:
+            print(f"\nProcessing {num_segments} segments ({SEGMENT_SIZE:,} rows each)")
+        
+        # Single segment case - no threading overhead needed
+        if num_segments == 1:
+            return self._compress_segment(columns, col_stats, 0, num_rows - 1, 0)
+        
+        # Multi-segment case - process in parallel
+        segment_results = [None] * num_segments
+        
+        def process_segment(seg_idx: int) -> Tuple[int, pa.Array, int, int]:
+            """Process a single segment and return (seg_idx, row_order, steps, clusters)."""
+            seg_start = seg_idx * SEGMENT_SIZE
+            seg_end = min((seg_idx + 1) * SEGMENT_SIZE - 1, num_rows - 1)
+            segment_size = seg_end - seg_start + 1
+            
+            # Slice columns to just this segment's rows for better performance
+            segment_indices = pa.array(np.arange(seg_start, seg_end + 1, dtype=np.int32))
+            segment_columns = [pc.take(col, segment_indices) for col in columns]
+            
+            # Process segment with 0-based indices within the segment
+            row_order, steps, clusters = self._compress_segment(
+                segment_columns, col_stats, 0, segment_size - 1, seg_idx
+            )
+            
+            # Convert segment-relative indices back to global indices
+            row_order_np = row_order.to_numpy(zero_copy_only=False) + seg_start
+            global_row_order = pa.array(row_order_np)
+            
+            return seg_idx, global_row_order, steps, clusters
+        
+        # Process segments in parallel using thread pool
+        total_steps = 0
+        total_clusters = 0
+        
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(process_segment, seg_idx): seg_idx
+                for seg_idx in range(num_segments)
+            }
+            
+            for future in as_completed(futures):
+                seg_idx, row_order, steps, clusters = future.result()
+                segment_results[seg_idx] = row_order
+                total_steps += steps
+                total_clusters += clusters
+                
+                if self.verbose:
+                    print(f"  Segment {seg_idx + 1}/{num_segments}: "
+                          f"{steps:,} steps, {clusters:,} clusters")
+        
+        # Combine segment results into single row order
+        combined_row_order = pa.concat_arrays(segment_results)
+        
+        return combined_row_order, total_steps, total_clusters
+    
+    def _compress_segment(
+        self,
+        columns: List[pa.ChunkedArray],
+        col_stats: List['_ColumnStats'],
+        seg_start: int,
+        seg_end: int,
+        segment_idx: int
+    ) -> Tuple[pa.Array, int, int]:
+        """
+        Process a single segment using the greedy bucket-splitting algorithm.
+        
+        This is the core optimization logic, isolated for parallel execution.
+        The columns passed should already be sliced to this segment's rows.
+        
+        Args:
+            columns: List of column data arrays (already sliced to segment)
+            col_stats: Pre-computed statistics for each column
+            seg_start: Start row index (0-based within segment)
+            seg_end: End row index (inclusive, 0-based within segment)
+            segment_idx: Segment index for progress logging
+        
+        Returns:
+            Tuple of (optimized_row_indices, step_count, total_clusters)
+        """
+        segment_size = seg_end - seg_start + 1
         num_cols = len(columns)
         
-        # Initialize row indices (sequential: 0, 1, 2, ...)
-        row_indices = pa.array(np.arange(num_rows, dtype=np.int32))
+        # Initialize row indices for this segment (0-based within segment)
+        row_indices = pa.array(np.arange(segment_size, dtype=np.int32))
         
-        # Initialize bucket queue with single bucket containing all rows
-        buckets = deque([_Bucket(0, num_rows - 1)])
+        # Initialize bucket queue with single bucket for this segment
+        # Bucket indices are 0-based within the segment's row_indices array
+        buckets = deque([_Bucket(0, segment_size - 1)])
         
         step_count = 0
         cluster_count = [0] * num_cols
+        
+        # Create a local histogram builder for thread safety
+        histogram_builder = _HistogramBuilder()
+        
+        # Progress tracking
+        progress_interval = 1000
         
         # Main optimization loop: process buckets until none remain
         while buckets:
@@ -298,6 +409,18 @@ class VertiPaqOptimizer:
                 continue
             
             step_count += 1
+            
+            # Safety limit: prevent infinite loops
+            if step_count >= MAX_STEPS_PER_SEGMENT:
+                if self.verbose:
+                    print(f"    [Segment] Hit max steps limit ({MAX_STEPS_PER_SEGMENT:,})")
+                break
+            
+            # Progress logging
+            if self.verbose and step_count % progress_interval == 0:
+                print(f"    [Segment {segment_idx}] Step {step_count:,}, "
+                      f"buckets in queue: {len(buckets):,}")
+            
             bucket_size = bucket.size()
             
             # Determine sampling rate for this bucket
@@ -316,7 +439,7 @@ class VertiPaqOptimizer:
                     continue
                 
                 # Build histogram for this column within this bucket
-                max_value, max_freq = self._histogram_builder.build_histogram(
+                max_value, max_freq = histogram_builder.build_histogram(
                     row_indices, columns[col_idx],
                     bucket.start, bucket.end,
                     sample_step, col_stats[col_idx]
@@ -581,7 +704,7 @@ class _HistogramBuilder:
             
             return most_frequent, frequency * step
     
-    def _find_max_with_tiebreak(self, values: np.ndarray) -> Tuple[Optional[int], int]:
+    def _find_max_with_tiebreak(self, values: np.ndarray) -> Tuple[Optional[any], int]:
         """
         Find the most frequent value with v1-compatible tie-breaking.
         
@@ -612,77 +735,110 @@ class _HistogramBuilder:
         if len(values) == 0:
             return None, 0
         
-        # Get min/max for range calculation
-        min_val = values.min()
-        max_val = values.max()
-        value_range = max_val - min_val + 1
+        # For object types (datetime, etc.) or complex types, use np.unique path
+        # These types don't support arithmetic operations needed for bincount
+        if values.dtype.kind in ('O', 'M', 'm', 'U', 'S'):  # object, datetime, timedelta, unicode, bytes
+            return self._find_max_unique(values)
         
-        # Choose strategy based on data density
-        # Use bincount for dense data (value_range <= 2x sample size)
-        # Use np.unique for sparse data (high cardinality)
-        use_bincount = value_range <= len(values) * 2
+        # For integer types, try bincount for dense data
+        try:
+            # Get min/max for range calculation
+            min_val = values.min()
+            max_val = values.max()
+            value_range = max_val - min_val + 1
+            
+            # Choose strategy based on data density
+            # Use bincount for dense data (value_range <= 2x sample size)
+            # Use np.unique for sparse data (high cardinality)
+            use_bincount = value_range <= len(values) * 2
+            
+            if use_bincount:
+                return self._find_max_bincount(values, min_val, value_range)
+            else:
+                return self._find_max_unique(values)
+        except (TypeError, ValueError):
+            # Fallback to unique for any unsupported types
+            return self._find_max_unique(values)
+    
+    def _find_max_bincount(self, values: np.ndarray, min_val, value_range) -> Tuple[Optional[any], int]:
+        """Find max frequency using bincount (fast for dense integer data)."""
+        shifted = values - min_val
+        counts = np.bincount(shifted, minlength=value_range)
+        max_count = counts.max()
         
-        if use_bincount:
-            # Dense data: use bincount (fast array-based histogram)
-            shifted = values - min_val
-            counts = np.bincount(shifted, minlength=value_range)
-            max_count = counts.max()
-            
-            if max_count == 0:
-                return None, 0
-            
-            max_indices = np.where(counts == max_count)[0]
-            
-            if len(max_indices) == 1:
-                return int(max_indices[0] + min_val), int(max_count)
-            
-            # Tie-breaking for bincount path
-            best_pos = len(values)
-            best_val = max_indices[0]
-            
-            for idx in max_indices:
-                positions = np.where(shifted == idx)[0]
-                reach_pos = positions[max_count - 1]
-                if reach_pos < best_pos:
-                    best_pos = reach_pos
-                    best_val = idx
-            
-            return int(best_val + min_val), int(max_count)
+        if max_count == 0:
+            return None, 0
         
-        else:
-            # Sparse data: use np.unique (hash-based, memory efficient)
-            unique_vals, counts = np.unique(values, return_counts=True)
-            max_count = counts.max()
-            
-            if max_count == 0:
-                return None, 0
-            
-            # Special case: all values appear only once (max_count == 1)
-            # Just return the first value in iteration order
-            if max_count == 1:
-                return int(values[0]), 1
-            
-            max_mask = counts == max_count
-            num_ties = max_mask.sum()
-            
-            if num_ties == 1:
-                # No ties - return the single max
-                max_idx = np.argmax(counts)
-                return int(unique_vals[max_idx]), int(max_count)
-            
-            # Ties exist - find which value first reaches max_count
-            candidates = unique_vals[max_mask]
-            best_pos = len(values)
-            best_val = candidates[0]
-            
-            for val in candidates:
-                positions = np.where(values == val)[0]
-                reach_pos = positions[max_count - 1]
-                if reach_pos < best_pos:
-                    best_pos = reach_pos
-                    best_val = val
-            
-            return int(best_val), int(max_count)
+        max_indices = np.where(counts == max_count)[0]
+        
+        if len(max_indices) == 1:
+            return int(max_indices[0] + min_val), int(max_count)
+        
+        # Tie-breaking for bincount path
+        best_pos = len(values)
+        best_val = max_indices[0]
+        
+        for idx in max_indices:
+            positions = np.where(shifted == idx)[0]
+            reach_pos = positions[max_count - 1]
+            if reach_pos < best_pos:
+                best_pos = reach_pos
+                best_val = idx
+        
+        return int(best_val + min_val), int(max_count)
+    
+    def _find_max_unique(self, values: np.ndarray) -> Tuple[Optional[any], int]:
+        """Find max frequency using np.unique (works for all types)."""
+        unique_vals, counts = np.unique(values, return_counts=True)
+        max_count = counts.max()
+        
+        if max_count == 0:
+            return None, 0
+        
+        # Special case: all values appear only once (max_count == 1)
+        # Just return the first value in iteration order
+        if max_count == 1:
+            # Return as native Python type for numeric, keep as-is for datetime/object
+            val = values[0]
+            return self._convert_value(val), 1
+        
+        max_mask = counts == max_count
+        num_ties = max_mask.sum()
+        
+        if num_ties == 1:
+            # No ties - return the single max
+            max_idx = np.argmax(counts)
+            val = unique_vals[max_idx]
+            return self._convert_value(val), int(max_count)
+        
+        # Ties exist - find which value first reaches max_count
+        candidates = unique_vals[max_mask]
+        best_pos = len(values)
+        best_val = candidates[0]
+        
+        for val in candidates:
+            positions = np.where(values == val)[0]
+            reach_pos = positions[max_count - 1]
+            if reach_pos < best_pos:
+                best_pos = reach_pos
+                best_val = val
+        
+        return self._convert_value(best_val), int(max_count)
+    
+    def _convert_value(self, val):
+        """Convert numpy value to appropriate Python type for PyArrow comparison."""
+        if val is None:
+            return None
+        # For datetime types, keep as numpy datetime64 for proper PyArrow scalar creation
+        if hasattr(val, 'dtype') and val.dtype.kind in ('M', 'm'):  # datetime64, timedelta64
+            return val
+        # For object types, return as-is
+        if hasattr(val, 'dtype') and val.dtype.kind == 'O':
+            return val
+        # For numeric types, convert to Python native
+        if hasattr(val, 'item'):
+            return val.item()
+        return val
 
 
 # ============================================================================
@@ -810,11 +966,14 @@ def optimize_table(
     the effectiveness of Run-Length Encoding compression used in columnar databases
     like Power BI, Analysis Services, and Parquet.
     
+    Data is processed in segments of 1M rows (aligned with Power BI's storage format)
+    and saved with matching Parquet row groups to preserve RLE benefits.
+    
     Args:
         data: Input data as pandas DataFrame, PyArrow Table, or Parquet file path
         columns: Columns to optimize (default: all except binary)
         verbose: Print progress information
-        output_path: Optional path to save optimized Parquet file
+        output_path: Optional path to save optimized Parquet file (row groups = 1M rows)
     
     Returns:
         Dictionary with optimization results:
@@ -849,12 +1008,14 @@ def optimize_table(
             result['table'],
             output_path,
             compression='zstd',
-            use_dictionary=True
+            use_dictionary=True,
+            row_group_size=SEGMENT_SIZE  # Align row groups with optimization segments
         )
         if verbose:
             import os
             file_size = os.path.getsize(output_path) / 1024 / 1024
             print(f"\nSaved to: {output_path} ({file_size:.1f} MB)")
+            print(f"Row group size: {SEGMENT_SIZE:,} rows (aligned with segments)")
     
     return result
 
