@@ -437,7 +437,35 @@ class VertiPaqOptimizer:
                 # Skip columns already processed for this bucket
                 if bucket.is_column_done(col_idx):
                     continue
+
+                # CHECK 1: Diminishing returns check - calculate distinct values in this bucket
+                bucket_indices = row_indices[bucket.start:bucket.end+1]
+                bucket_column_data = pc.take(columns[col_idx], bucket_indices)
                 
+                # Handle dictionary-encoded columns
+                if col_stats[col_idx].is_dictionary:
+                    # For dictionary columns, work with indices
+                    if isinstance(bucket_column_data, pa.ChunkedArray):
+                        bucket_column_data = bucket_column_data.combine_chunks()
+                    bucket_distinct_values = pc.count_distinct(bucket_column_data.indices, mode='only_valid').as_py()
+                else:
+                    # For non-dictionary columns, use standard count_distinct
+                    bucket_distinct_values = pc.count_distinct(bucket_column_data, mode='only_valid').as_py()
+                
+                if bucket_distinct_values > 0 and bucket_size / bucket_distinct_values < 64.0:
+                    bucket.mark_column_done(col_idx)
+                    continue
+                
+                if bucket_distinct_values > 0 and segment_size / bucket_distinct_values < 64.0:
+                    bucket.mark_column_done(col_idx)
+                    continue
+
+                # CHECK 2: Maximum possible savings
+                max_possible_savings = bucket_size * col_stats[col_idx].bits_per_value
+                if max_possible_savings <= BIT_SAVINGS_THRESHOLD:
+                    bucket.mark_column_done(col_idx)
+                    continue
+
                 # Build histogram for this column within this bucket
                 max_value, max_freq = histogram_builder.build_histogram(
                     row_indices, columns[col_idx],
@@ -455,7 +483,7 @@ class VertiPaqOptimizer:
                 savings = max_freq * col_stats[col_idx].bits_per_value
                 
                 # Check threshold: is this worth splitting?
-                if savings < BIT_SAVINGS_THRESHOLD:
+                if savings <= BIT_SAVINGS_THRESHOLD:
                     bucket.mark_column_done(col_idx)
                     continue
                 
@@ -481,7 +509,7 @@ class VertiPaqOptimizer:
             # Don't split if matching group is too small
             if match_count < MIN_SPLIT_SIZE:
                 bucket.is_done = True
-                buckets.append(bucket)
+                # buckets.append(bucket)
                 continue
             
             # Check if all rows match (bucket is now pure for this column)
