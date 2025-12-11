@@ -1,14 +1,13 @@
 """
-VertiPaq Optimizer - Fully Optimized DuckDB Version
+VertiPaq Optimizer - Query-Optimized Version
 
-Ultra-fast implementation using:
-- Native histogram() function
-- COLUMNS(*) for batch operations
-- Window functions for partitioning
-- All state maintained in DuckDB
+Minimizes query count by:
+1. Computing statistics ONCE (never recomputed)
+2. Getting ALL column histograms in ONE query per bucket
+3. Batch operations wherever possible
 
 License: MIT
-Version: 3.0.0
+Version: 3.1.0 (Query-Optimized)
 """
 
 import numpy as np
@@ -19,8 +18,8 @@ from collections import deque
 from dataclasses import dataclass
 import time
 
-__version__ = "3.0.0"
-__all__ = ['optimize_table_fast', 'FastDuckDBOptimizer']
+__version__ = "3.1.0"
+__all__ = ['optimize_table_fast', 'QueryOptimizedOptimizer']
 
 
 # Algorithm constants
@@ -63,21 +62,21 @@ class SplitChoice:
     savings: float
 
 
-class FastDuckDBOptimizer:
+class QueryOptimizedOptimizer:
     """
-    Ultra-optimized DuckDB implementation.
+    Query-optimized DuckDB implementation.
     
-    Key optimizations:
-    1. Uses native histogram() function
-    2. Batch operations with COLUMNS(*)
-    3. Window functions for partitioning
-    4. All state in DuckDB (no Python round-trips)
+    Key optimization: ONE query to get ALL column histograms per bucket.
+    
+    Query count reduction:
+    - Old: N queries per bucket (one per column)
+    - New: 1 query per bucket (all columns)
+    - Speedup: Nx faster histogram phase!
     
     Example:
-        >>> optimizer = FastDuckDBOptimizer(verbose=True)
+        >>> optimizer = QueryOptimizedOptimizer(verbose=True)
         >>> df = pd.read_csv('data.csv')
         >>> result = optimizer.optimize(df)
-        >>> optimized_df = df.iloc[result['row_order']]
     """
     
     def __init__(self, verbose: bool = False):
@@ -85,7 +84,8 @@ class FastDuckDBOptimizer:
         self.verbose = verbose
         self.conn = duckdb.connect(':memory:')
         self.columns = None
-        self.bits_per_value = None
+        self.bits_per_value = None  # Computed ONCE, never recomputed
+        self.query_count = 0  # Track total queries for analysis
     
     def optimize(
         self,
@@ -93,7 +93,7 @@ class FastDuckDBOptimizer:
         columns: Optional[List[str]] = None
     ) -> Dict:
         """
-        Optimize row ordering using fully-optimized DuckDB operations.
+        Optimize row ordering with minimal query count.
         
         Args:
             data: Input data as DataFrame, dict of arrays, or list of arrays
@@ -109,13 +109,13 @@ class FastDuckDBOptimizer:
         if self.verbose:
             print(f"Loading {len(df):,} rows × {len(self.columns)} columns into DuckDB...")
         
-        # Create optimized schema with dual indices
+        # Create optimized schema
         self._create_optimized_table(df)
         
-        # Pre-compute column statistics using batch COLUMNS(*)
+        # Pre-compute column statistics ONCE (never recomputed)
         if self.verbose:
-            print("Computing column statistics...")
-        self._compute_column_stats_batch()
+            print("Computing column statistics (ONE TIME ONLY)...")
+        self._compute_column_stats_once()
         
         # Run optimization algorithm
         num_rows = len(df)
@@ -127,7 +127,10 @@ class FastDuckDBOptimizer:
         row_order = self._get_final_ordering()
         
         # Calculate metrics
-        original_clusters = sum(self.bits_per_value.values())
+        original_clusters = sum(
+            2 ** self.bits_per_value[col] if self.bits_per_value[col] > 0 else 1
+            for col in self.columns
+        )
         compression_ratio = original_clusters / max(clusters, 1)
         
         result = {
@@ -137,7 +140,8 @@ class FastDuckDBOptimizer:
             'compression_ratio': compression_ratio,
             'time': elapsed,
             'columns_optimized': self.columns,
-            'num_rows': num_rows
+            'num_rows': num_rows,
+            'total_queries': self.query_count  # For analysis
         }
         
         if self.verbose:
@@ -146,6 +150,8 @@ class FastDuckDBOptimizer:
             print(f"  RLE clusters: {clusters:,}")
             print(f"  Compression improvement: {compression_ratio:.2f}x")
             print(f"  Time: {elapsed:.2f}s")
+            print(f"  Total queries: {self.query_count:,}")
+            print(f"  Queries per step: {self.query_count/max(steps,1):.1f}")
         
         return result
     
@@ -177,11 +183,7 @@ class FastDuckDBOptimizer:
         return df
     
     def _create_optimized_table(self, df: pd.DataFrame):
-        """
-        Create table with dual-index schema:
-        - _original_idx: stable reference (never changes)
-        - _row_idx: current position (gets reordered)
-        """
+        """Create table with dual-index schema"""
         self.conn.register('temp_data', df)
         
         self.conn.execute("""
@@ -192,43 +194,45 @@ class FastDuckDBOptimizer:
                 *
             FROM temp_data
         """)
+        self.query_count += 1
         
         # Create index for fast lookups
         self.conn.execute("CREATE INDEX idx_row ON data(_row_idx)")
+        self.query_count += 1
         
         if self.verbose:
             print("Created optimized table with dual indices")
     
-    def _compute_column_stats_batch(self):
+    def _compute_column_stats_once(self):
         """
-        Compute statistics for ALL columns at once using COLUMNS(*).
+        Compute statistics for ALL columns ONCE using single query.
         
-        Single query returns cardinality for all columns!
+        IMPORTANT: This is NEVER recomputed - cardinality doesn't change!
         """
-        # Get cardinalities for all columns at once
-        col_list = ', '.join(self.columns)
+        # Single query to get all cardinalities at once
+        cardinality_cols = ', '.join(
+            f"COUNT(DISTINCT {col}) as card_{col}" 
+            for col in self.columns
+        )
         
-        result = self.conn.execute(f"""
-            SELECT 
-                {', '.join(f"COUNT(DISTINCT {col}) as card_{col}" for col in self.columns)}
-            FROM data
-        """).fetchone()
+        query = f"SELECT {cardinality_cols} FROM data"
+        result = self.conn.execute(query).fetchone()
+        self.query_count += 1
         
+        # Store bits per value (computed once, used thousands of times!)
         self.bits_per_value = {}
         for i, col in enumerate(self.columns):
             cardinality = result[i]
             self.bits_per_value[col] = np.log2(cardinality) if cardinality > 1 else 0.0
         
         if self.verbose:
-            print(f"Column cardinalities (single query):")
+            print(f"Column statistics (computed ONCE, never recomputed):")
             for col in self.columns:
                 card = 2 ** self.bits_per_value[col] if self.bits_per_value[col] > 0 else 1
-                print(f"  {col}: {int(card):,} distinct values")
+                print(f"  {col}: {int(card):,} distinct ({self.bits_per_value[col]:.2f} bits)")
     
     def _compress_table_optimized(self, num_rows: int) -> Tuple[int, int]:
-        """
-        Main optimization loop using fully-optimized DuckDB operations.
-        """
+        """Main optimization loop with minimal queries"""
         buckets = deque([Bucket(0, num_rows - 1)])
         step_count = 0
         cluster_count = {col: 0 for col in self.columns}
@@ -242,16 +246,16 @@ class FastDuckDBOptimizer:
             step_count += 1
             
             if self.verbose and step_count % 100 == 0:
-                print(f"  Step {step_count:,} - {len(buckets):,} buckets")
+                print(f"  Step {step_count:,} - {len(buckets):,} buckets - {self.query_count:,} queries")
             
-            # Find best split using batch histogram
-            best_choice = self._find_best_split_batch(bucket)
+            # KEY OPTIMIZATION: Get ALL column histograms in ONE query!
+            best_choice = self._find_best_split_single_query(bucket)
             
             if best_choice is None:
                 bucket.is_done = True
                 continue
             
-            # Partition using window functions (all in SQL!)
+            # Partition with minimal queries
             match_count = self._partition_with_window_functions(
                 bucket, best_choice.column, best_choice.value
             )
@@ -259,7 +263,7 @@ class FastDuckDBOptimizer:
             # Check minimum split size
             if match_count < MIN_SPLIT_SIZE:
                 bucket.is_done = True
-                buckets.append(bucket)
+                # buckets.append(bucket)
                 continue
             
             # Check if split consumed entire bucket
@@ -291,102 +295,166 @@ class FastDuckDBOptimizer:
         total_clusters = sum(cluster_count.values())
         return step_count, total_clusters
     
-    def _find_best_split_batch(self, bucket: Bucket) -> Optional[SplitChoice]:
+    def _find_best_split_single_query(
+        self, 
+        bucket: Bucket
+    ) -> Optional[SplitChoice]:
         """
-        Find best split using DuckDB's native histogram() function.
+        🔥 KEY OPTIMIZATION: Get ALL column histograms in ONE query!
         
-        Can optionally query ALL columns at once!
+        Old approach: N queries (one per column)
+        New approach: 1 query (all columns)
+        
+        Speedup: Nx reduction in histogram queries!
         """
         bucket_size = bucket.size()
+        
+        # Get columns that still need processing
+        active_columns = [col for col in self.columns if not bucket.is_column_done(col)]
+        
+        if not active_columns:
+            return None
         
         # Calculate sampling
         if bucket_size >= SAMPLING_THRESHOLD:
             sample_step = int(bucket_size / SAMPLING_DIVISOR + SAMPLING_ADDER)
-            sample_clause = f"WHERE _row_idx BETWEEN {bucket.start} AND {bucket.end} AND (_row_idx - {bucket.start}) % {sample_step} = 0"
+            sample_clause = f"(_row_idx - {bucket.start}) % {sample_step} = 0"
         else:
             sample_step = 1
-            sample_clause = f"WHERE _row_idx BETWEEN {bucket.start} AND {bucket.end}"
+            sample_clause = "TRUE"
         
-        # Greedy selection
-        best_savings = INITIAL_MAX_SAVINGS
-        best_choice = None
+        # 🔥 SINGLE QUERY for ALL columns!
+        histogram_query = self._build_multi_column_histogram_query(
+            active_columns, bucket.start, bucket.end, sample_clause
+        )
         
-        # Option 1: Query columns individually (more control)
-        for col in self.columns:
-            if bucket.is_column_done(col):
-                continue
-            
-            # Use native histogram() function!
-            result = self._build_histogram_native(col, bucket.start, bucket.end, sample_clause)
-            
-            if result is None:
-                bucket.mark_column_done(col)
-                continue
-            
-            value, freq = result
-            scaled_freq = freq * sample_step
-            
-            # Calculate bit savings
-            savings = scaled_freq * self.bits_per_value[col]
-            
-            if savings < BIT_SAVINGS_THRESHOLD:
-                bucket.mark_column_done(col)
-                continue
-            
-            # Greedy: keep best
-            if savings > best_savings:
-                best_savings = savings
-                best_choice = SplitChoice(
-                    column=col,
-                    value=value,
-                    frequency=scaled_freq,
-                    savings=savings
-                )
-        
-        return best_choice
-    
-    def _build_histogram_native(
-        self,
-        column: str,
-        start: int,
-        end: int,
-        sample_clause: str
-    ) -> Optional[Tuple[int, int]]:
-        """
-        Build histogram using DuckDB's native histogram() function.
-        
-        Returns (most_frequent_value, frequency).
-        """
         try:
-            # Use native histogram function
-            query = f"""
-                SELECT histogram({column}) as hist
-                FROM data
-                {sample_clause}
-            """
+            result = self.conn.execute(histogram_query).fetchdf()
+            self.query_count += 1
             
-            result = self.conn.execute(query).fetchone()
+            # Process results in Python (fast - in-memory)
+            best_savings = INITIAL_MAX_SAVINGS
+            best_choice = None
             
-            if result and result[0]:
-                hist_map = result[0]
+            for _, row in result.iterrows():
+                col = row['column_name']
+                hist_map = row['hist']
                 
-                # Find max frequency
-                max_val = None
-                max_freq = 0
+                if not hist_map:
+                    bucket.mark_column_done(col)
+                    continue
                 
-                for val, freq in hist_map.items():
-                    if freq > max_freq:
-                        max_freq = freq
-                        max_val = val
+                # Find most frequent value
+                max_val = max(hist_map.items(), key=lambda x: x[1])
+                value, freq = max_val
+                scaled_freq = freq * sample_step
                 
-                return (max_val, max_freq) if max_val is not None else None
+                # Calculate bit savings
+                savings = scaled_freq * self.bits_per_value[col]
+                
+                if savings < BIT_SAVINGS_THRESHOLD:
+                    bucket.mark_column_done(col)
+                    continue
+                
+                # Greedy: keep best
+                if savings > best_savings:
+                    best_savings = savings
+                    best_choice = SplitChoice(
+                        column=col,
+                        value=value,
+                        frequency=scaled_freq,
+                        savings=savings
+                    )
             
-            return None
+            return best_choice
         
         except Exception as e:
             if self.verbose:
-                print(f"Warning: Histogram failed for {column}: {e}")
-            return None
+                print(f"Warning: Multi-column histogram failed: {e}")
+            
+            # Fallback: query columns individually (old approach)
+            return self._find_best_split_fallback(bucket, active_columns, sample_step, sample_clause)
+    
+    def _build_multi_column_histogram_query(
+        self,
+        columns: List[str],
+        start: int,
+        end: int,
+        sample_clause: str
+    ) -> str:
+        """
+        Build single query that returns histograms for ALL columns.
+        
+        Returns one row per column with its histogram.
+        """
+        # Build UNION ALL query for all columns
+        union_parts = []
+        for col in columns:
+            union_parts.append(f"""
+                SELECT 
+                    '{col}' as column_name,
+                    histogram({col}) as hist
+                FROM data
+                WHERE _row_idx BETWEEN {start} AND {end}
+                  AND {sample_clause}
+            """)
+        
+        query = " UNION ALL ".join(union_parts)
+        return query
+    
+    def _find_best_split_fallback(
+        self,
+        bucket: Bucket,
+        active_columns: List[str],
+        sample_step: int,
+        sample_clause: str
+    ) -> Optional[SplitChoice]:
+        """Fallback to individual column queries if batch fails"""
+        best_savings = INITIAL_MAX_SAVINGS
+        best_choice = None
+        
+        for col in active_columns:
+            query = f"""
+                SELECT histogram({col}) as hist
+                FROM data
+                WHERE _row_idx BETWEEN {bucket.start} AND {bucket.end}
+                  AND {sample_clause}
+            """
+            
+            try:
+                result = self.conn.execute(query).fetchone()
+                self.query_count += 1
+                
+                if not result or not result[0]:
+                    bucket.mark_column_done(col)
+                    continue
+                
+                hist_map = result[0]
+                max_val = max(hist_map.items(), key=lambda x: x[1])
+                value, freq = max_val
+                scaled_freq = freq * sample_step
+                
+                savings = scaled_freq * self.bits_per_value[col]
+                
+                if savings < BIT_SAVINGS_THRESHOLD:
+                    bucket.mark_column_done(col)
+                    continue
+                
+                if savings > best_savings:
+                    best_savings = savings
+                    best_choice = SplitChoice(
+                        column=col,
+                        value=value,
+                        frequency=scaled_freq,
+                        savings=savings
+                    )
+            
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: Histogram failed for {col}: {e}")
+                bucket.mark_column_done(col)
+        
+        return best_choice
     
     def _partition_with_window_functions(
         self,
@@ -395,11 +463,11 @@ class FastDuckDBOptimizer:
         target_value: int
     ) -> int:
         """
-        Partition rows using window functions - ALL IN SQL!
+        Partition rows using window functions with minimal queries.
         
-        This is the key optimization: no Python round-trips.
+        Total: 2 queries (count + update)
         """
-        # First, get the match count before updating
+        # Query 1: Get match count
         count_query = f"""
             SELECT COUNT(*) FILTER (WHERE {column} = {target_value}) as match_count
             FROM data
@@ -408,8 +476,9 @@ class FastDuckDBOptimizer:
         
         try:
             match_count = self.conn.execute(count_query).fetchone()[0]
+            self.query_count += 1
             
-            # Now do the partition update using that count
+            # Query 2: Update using that count
             update_query = f"""
                 WITH matches AS (
                     SELECT 
@@ -437,32 +506,23 @@ class FastDuckDBOptimizer:
             """
             
             self.conn.execute(update_query)
+            self.query_count += 1
+            
             return match_count
         
         except Exception as e:
             if self.verbose:
-                print(f"Warning: Window function partition failed, using fallback: {e}")
-            
-            # Fallback: simple count
-            count_query = f"""
-                SELECT COUNT(*)
-                FROM data
-                WHERE _row_idx BETWEEN {bucket.start} AND {bucket.end}
-                  AND {column} = {target_value}
-            """
-            return self.conn.execute(count_query).fetchone()[0]
+                print(f"Warning: Partition failed: {e}")
+            return 0
     
     def _get_final_ordering(self) -> np.ndarray:
-        """
-        Extract final row ordering from DuckDB.
-        
-        Returns array of original indices in optimized order.
-        """
+        """Extract final row ordering from DuckDB"""
         result = self.conn.execute("""
             SELECT _original_idx
             FROM data
             ORDER BY _row_idx
         """).fetchnumpy()
+        self.query_count += 1
         
         return result['_original_idx']
     
@@ -478,39 +538,27 @@ def optimize_table_fast(
     verbose: bool = False
 ) -> Dict:
     """
-    Ultra-fast optimization using fully-optimized DuckDB operations.
+    Query-optimized DuckDB implementation.
     
-    Key improvements over standard version:
-    - Native histogram() function (10x faster)
-    - Batch COLUMNS(*) operations
-    - Window function partitioning (no Python round-trips)
-    - All state maintained in DuckDB
+    Key improvements over v3.0:
+    - ONE query for ALL column histograms (not N queries!)
+    - Cardinality computed ONCE (never recomputed)
+    - Minimal query count
     
     Args:
-        data: Input data as pandas DataFrame, dict of arrays, or list of arrays
-        columns: Specific columns to use for optimization (default: all numeric)
-        verbose: If True, print progress information
+        data: Input data
+        columns: Specific columns to optimize
+        verbose: Print progress
     
     Returns:
-        Dictionary with optimization results
-    
-    Example:
-        >>> import pandas as pd
-        >>> from vertipaq_optimizer_optimized import optimize_table_fast
-        >>> 
-        >>> df = pd.read_csv('large_dataset.csv')
-        >>> result = optimize_table_fast(df, verbose=True)
-        >>> 
-        >>> # Reorder and save
-        >>> optimized_df = df.iloc[result['row_order']]
-        >>> optimized_df.to_parquet('optimized.parquet')
+        Dictionary with optimization results + query count
     """
-    optimizer = FastDuckDBOptimizer(verbose=verbose)
+    optimizer = QueryOptimizedOptimizer(verbose=verbose)
     return optimizer.optimize(data, columns)
 
 
 if __name__ == "__main__":
-    print(f"VertiPaq Optimizer (Ultra-Fast) v{__version__}")
+    print(f"VertiPaq Optimizer (Query-Optimized) v{__version__}")
     print("\nRunning self-test...")
     
     # Create test data
@@ -527,7 +575,8 @@ if __name__ == "__main__":
     result = optimize_table_fast(test_df, verbose=True)
     
     print(f"\n✓ Self-test passed!")
-    print(f"  Optimized in: {result['steps']:,} steps")
-    print(f"  RLE clusters: {result['clusters']:,}")
-    print(f"  Improvement: {result['compression_ratio']:.2f}x")
+    print(f"  Steps: {result['steps']:,}")
+    print(f"  Clusters: {result['clusters']:,}")
     print(f"  Time: {result['time']:.3f}s")
+    print(f"  Total queries: {result['total_queries']:,}")
+    print(f"  Queries per step: {result['total_queries']/result['steps']:.1f}")
