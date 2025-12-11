@@ -29,10 +29,10 @@ import pyarrow.parquet as pq
 import pandas as pd
 import numpy as np
 from typing import Union, List, Optional, Tuple, Dict
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import warnings
+import heapq
 
 __version__ = "2.1.0"
 __all__ = ['optimize_table', 'VertiPaqOptimizer', 'optimize_parquet']
@@ -387,9 +387,10 @@ class VertiPaqOptimizer:
         # Initialize row indices for this segment (0-based within segment)
         row_indices = pa.array(np.arange(segment_size, dtype=np.int32))
         
-        # Initialize bucket queue with single bucket for this segment
+        # Initialize bucket heap with single bucket for this segment
         # Bucket indices are 0-based within the segment's row_indices array
-        buckets = deque([_Bucket(0, segment_size - 1)])
+        buckets = [_Bucket(0, segment_size - 1)]
+        heapq.heapify(buckets)  # Convert to heap
         
         step_count = 0
         cluster_count = [0] * num_cols
@@ -402,11 +403,8 @@ class VertiPaqOptimizer:
         
         # Main optimization loop: process buckets until none remain
         while buckets:
-            bucket = buckets.popleft()
-            
-            # Skip buckets that are already marked as done
-            if bucket.is_done:
-                continue
+            # Pop SMALLEST bucket (min-heap prioritizes smaller buckets)
+            bucket = heapq.heappop(buckets)
             
             step_count += 1
             
@@ -419,7 +417,10 @@ class VertiPaqOptimizer:
             # Progress logging
             if self.verbose and step_count % progress_interval == 0:
                 print(f"    [Segment {segment_idx}] Step {step_count:,}, "
-                      f"buckets in queue: {len(buckets):,}")
+                      f"buckets in queue: {len(buckets):,}, "
+                      f"processing bucket rows {bucket.start:,}-{bucket.end:,}, "
+                      f"current bucket size: {bucket.size():,} rows, "
+                      f"clusters so far: {sum(cluster_count):,}")
             
             bucket_size = bucket.size()
             
@@ -464,10 +465,9 @@ class VertiPaqOptimizer:
                     best_savings = savings
                     best_choice = (col_idx, max_value, max_freq)
             
-            # No profitable split found - mark bucket as done
+            # No profitable split found - bucket exhausted
             if best_choice is None:
-                bucket.is_done = True
-                continue
+                continue  # Bucket removed from heap, we're done with it
             
             # Partition rows based on selected column/value
             col_idx, target_value, _ = best_choice
@@ -480,9 +480,7 @@ class VertiPaqOptimizer:
             # Check minimum split size
             # Don't split if matching group is too small
             if match_count < MIN_SPLIT_SIZE:
-                bucket.is_done = True
-                buckets.append(bucket)
-                continue
+                continue  # Can't split, bucket exhausted
             
             # Check if all rows match (bucket is now pure for this column)
             non_match_count = bucket_size - match_count
@@ -490,7 +488,8 @@ class VertiPaqOptimizer:
                 # All (or almost all) rows match - mark column as done
                 bucket.mark_column_done(col_idx)
                 cluster_count[col_idx] += 1
-                buckets.append(bucket)
+                # Re-add bucket to process other columns
+                heapq.heappush(buckets, bucket)
                 continue
             
             # Create two new buckets from the split
@@ -506,9 +505,9 @@ class VertiPaqOptimizer:
             impure_bucket = _Bucket(bucket.start + match_count, bucket.end)
             impure_bucket.columns_done = bucket.columns_done
             
-            # Add buckets back to queue for further processing
-            buckets.append(pure_bucket)
-            buckets.append(impure_bucket)
+            # Add buckets back to heap for further processing
+            heapq.heappush(buckets, pure_bucket)
+            heapq.heappush(buckets, impure_bucket)
             
             # Track cluster creation (one RLE run created for this column)
             cluster_count[col_idx] += 1
@@ -532,13 +531,12 @@ class _Bucket:
     Buckets are recursively subdivided until no further compression
     improvement is possible.
     """
-    __slots__ = ['start', 'end', 'columns_done', 'is_done']
+    __slots__ = ['start', 'end', 'columns_done']
     
     def __init__(self, start: int, end: int):
         self.start = start
         self.end = end
         self.columns_done = 0  # Bit flags for completed columns
-        self.is_done = False
     
     def size(self) -> int:
         """Return the number of rows in this bucket."""
@@ -558,7 +556,19 @@ class _Bucket:
     def is_column_done(self, col_idx: int) -> bool:
         """Check if a column has been fully processed for this bucket."""
         return (self.columns_done & (1 << col_idx)) != 0
-
+    
+    # Priority queue comparison (for heapq)
+    def __lt__(self, other) -> bool:
+        """Smaller buckets have higher priority"""
+        self_size = self.size()
+        other_size = other.size()
+        if self_size != other_size:
+            return self_size < other_size
+        # Tie-break by start index
+        return self.start < other.start
+    
+    def __eq__(self, other) -> bool:
+        return self.start == other.start and self.end == other.end
 
 class _ColumnStats:
     """
